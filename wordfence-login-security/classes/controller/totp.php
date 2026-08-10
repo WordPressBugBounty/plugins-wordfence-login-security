@@ -37,7 +37,9 @@ class Controller_TOTP {
 		
 		global $wpdb;
 		$table = Controller_DB::shared()->secrets;
-		$wpdb->query($wpdb->prepare("INSERT INTO `{$table}` (`user_id`, `secret`, `recovery`, `ctime`, `vtime`, `mode`) VALUES (%d, %s, %s, UNIX_TIMESTAMP(), %d, 'authenticator')", $user->ID, Model_Compat::hex2bin($secret), implode('', array_map(function($r) { return Model_Compat::hex2bin($r); }, $recovery)), $vtime));
+		if ($wpdb->query($wpdb->prepare("INSERT INTO `{$table}` (`user_id`, `secret`, `recovery`, `ctime`, `vtime`, `mode`) VALUES (%d, %s, %s, UNIX_TIMESTAMP(), %d, 'authenticator')", $user->ID, Model_Compat::hex2bin($secret), implode('', array_map(function($r) { return Model_Compat::hex2bin($r); }, $recovery)), $vtime)) !== false) {
+			Controller_Users::shared()->clear_2fa_active_cache($user->ID);
+		}
 		
 		/**
 		 * Fires when 2FA is enabled for a user.

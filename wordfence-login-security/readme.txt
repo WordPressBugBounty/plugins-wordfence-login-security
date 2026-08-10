@@ -3,8 +3,8 @@ Contributors: wfryan, wfmattr, mmaunder, wfmatt
 Tags: security, login security, 2fa, two factor authentication, captcha, xml-rpc, mfa, 2 factor
 Requires at least: 4.7
 Requires PHP: 7.0
-Tested up to: 7.0
-Stable tag: 1.1.16
+Tested up to: 7.1
+Stable tag: 1.1.18
 
 Secure your website with Wordfence Login Security, providing two-factor authentication, login and registration CAPTCHA, and XML-RPC protection.
 
@@ -14,7 +14,7 @@ Secure your website with Wordfence Login Security, providing two-factor authenti
 
 Wordfence Login Security contains a subset of the functionality found in the full Wordfence plugin: Two-factor Authentication, XML-RPC Protection, and Login Page CAPTCHA.
 
-**This plugin is being discontinued on or around July 1, 2026.**
+**This plugin is being discontinued on or around August 12, 2026.**
 
 All of its features are already included in the main Wordfence plugin, which is also available to use for free. We recommend installing Wordfence to continue receiving updates, security improvements, and full functionality.
 
@@ -61,6 +61,13 @@ Secure your website with Wordfence Login Security.
 3. Configuration options include XML-RPC protection and login page CAPTCHA.
 
 == Changelog ==
+
+= 1.1.18 - August 10, 2026 =
+* Change: Hardened 2FA flow when installed next to plugins with non-standard authentication (credit: Austin Ginder of Anchor Hosting)
+* Change: Hardened 2FA remember cookie handling
+* Fix: Fixed an issue with the 2FA embed shortcode that could prevent loading needed JavaScript/CSS assets
+* Fix: Fixed an error with Divi i18n when a user had exhausted all 2FA recovery codes
+* Note: The standalone Login Security plugin will be discontinued around August 12, 2026. Sites using it should [install the full Wordfence plugin](https://wordpress.org/plugins/wordfence/) to retain this functionality
 
 = 1.1.16 - April 29, 2026 =
 * Improvement: Migrated all deprecated JavaScript libraries in use to a Vue-based infrastructure

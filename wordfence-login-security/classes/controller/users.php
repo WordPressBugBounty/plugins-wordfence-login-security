@@ -21,8 +21,14 @@ class Controller_Users {
 	const CAPTCHA_SCORE_LIMIT = 2; //Max number of captcha scores cached
 	const CAPTCHA_SCORE_TRANSIENT_PREFIX = 'wfls_captcha_';
 	const CAPTCHA_SCORE_CACHE_DURATION = 60; //seconds
+	const REMEMBERED_DEVICE_COOKIE_PREFIX = 'wfls-remembered-';
+	const REMEMBERED_DEVICE_COOKIE_TYPE = 'remembered-device';
+	const REMEMBERED_DEVICE_COOKIE_VERSION = 2;
 	const LARGE_USER_BASE_THRESHOLD = 1000;
 	const TRUNCATED_ROLE_KEY = 1;
+
+	private $twoFactorEnrollmentIDCache = array();
+	private $remembered2FACache = array();
 	
 	/**
 	 * Returns the singleton Controller_Users.
@@ -60,8 +66,10 @@ class Controller_Users {
 			$ctime = (int) $parameters['ctime'];
 			$vtime = min((int) $parameters['vtime'], Controller_Time::time());
 			$type = $parameters['type'];
-			$wpdb->query($wpdb->prepare("INSERT INTO `{$table}` (`user_id`, `secret`, `recovery`, `ctime`, `vtime`, `mode`) VALUES (%d, %s, %s, %d, %d, %s)", $user->ID, $secret, $recovery, $ctime, $vtime, $type));
-			$count++;
+			if ($wpdb->query($wpdb->prepare("INSERT INTO `{$table}` (`user_id`, `secret`, `recovery`, `ctime`, `vtime`, `mode`) VALUES (%d, %s, %s, %d, %d, %s)", $user->ID, $secret, $recovery, $ctime, $vtime, $type)) !== false) {
+				$this->clear_2fa_active_cache($user->ID);
+				$count++;
+			}
 		}
 		return $count;
 	}
@@ -105,47 +113,29 @@ class Controller_Users {
 	 * @return bool
 	 */
 	public function has_remembered_2fa($user) {
-		static $_cache = array();
-		if (isset($_cache[$user->ID])) {
-			return $_cache[$user->ID];
+		$userID = (int) $user->ID;
+		if (array_key_exists($userID, $this->remembered2FACache)) {
+			return $this->remembered2FACache[$userID];
 		}
 		
 		if (!Controller_Settings::shared()->get_bool(Controller_Settings::OPTION_REMEMBER_DEVICE_ENABLED)) {
 			return false;
 		}
 		
-		$maxExpiration = \WordfenceLS\Controller_Time::time() + Controller_Settings::shared()->get_int(Controller_Settings::OPTION_REMEMBER_DEVICE_DURATION);
-		
-		$encrypted = Model_Symmetric::encrypt((string) $user->ID);
-		if (!$encrypted) { //Can't generate cookie key due to host failure
-			return false;
-		}
-		
 		foreach ($_COOKIE as $name => $value) {
-			if (!preg_match('/^wfls\-remembered\-(.+)$/', $name, $matches)) {
+			$rememberedDevice = $this->decode_remembered_device_cookie($name, $value);
+			if ($rememberedDevice === false || $rememberedDevice['user'] !== (string) $user->ID) {
 				continue;
 			}
-			
-			$jwt = Model_JWT::decode_jwt($value);
-			if (!$jwt || !isset($jwt->payload['iv'])) {
-				continue;
-			}
-			
-			if (\WordfenceLS\Controller_Time::time() > min($jwt->expiration, $maxExpiration)) { //Either JWT is expired or the remember period was shortened since generating it
-				continue;
-			}
-			
-			$data = Model_JWT::base64url_convert_from($matches[1]);
-			$iv = $jwt->payload['iv'];
-			$encrypted = array('data' => $data, 'iv' => $iv);
-			$userID = (int) Model_Symmetric::decrypt($encrypted);
-			if ($userID != 0 && $userID == $user->ID) {
-				$_cache[$user->ID] = true;
+
+			$enrollmentID = $this->two_factor_enrollment_id($user);
+			if ($enrollmentID !== false && $rememberedDevice['enrollment'] === $enrollmentID) {
+				$this->remembered2FACache[$userID] = true;
 				return true;
 			}
 		}
-		
-		$_cache[$user->ID] = false;
+
+		$this->remembered2FACache[$userID] = false;
 		return false;
 	}
 	
@@ -162,26 +152,113 @@ class Controller_Users {
 		if ($this->has_remembered_2fa($user)) {
 			return;
 		}
-		
-		$encrypted = Model_Symmetric::encrypt((string) $user->ID);
-		if (!$encrypted) { //Can't generate cookie key due to host failure
+
+		$enrollmentID = $this->two_factor_enrollment_id($user);
+		if ($enrollmentID === false) {
 			return;
 		}
 		
-		//Remove old cookies
+		$cookie = $this->create_remembered_device_cookie($user, $enrollmentID);
+		if ($cookie === false) { //Can't generate cookie due to host failure
+			return;
+		}
+		
+		//Remove legacy, invalid, and superseded cookies, while preserving cookies for other users
 		foreach ($_COOKIE as $name => $value) {
-			if (!preg_match('/^wfls\-remembered\-(.+)$/', $name, $matches)) {
+			if (!$this->should_remove_remembered_device_cookie($name, $value, $user)) {
 				continue;
 			}
-			setcookie($name, '', \WordfenceLS\Controller_Time::time() - 86400);
+			setcookie($name, '', \WordfenceLS\Controller_Time::time() - 86400, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
 		}
 		
 		//Set the new one
+		setcookie($cookie['name'], $cookie['value'], $cookie['expiration'], COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
+	}
+
+	/**
+	 * Creates an authenticated remembered-device cookie for a user and enrollment.
+	 *
+	 * @param \WP_User $user The user to remember.
+	 * @param string $enrollmentID The user's current 2FA enrollment identifier.
+	 * @return array|bool The cookie parameters, or false if encryption fails.
+	 */
+	private function create_remembered_device_cookie($user, $enrollmentID) {
+		$encrypted = Model_Symmetric::encrypt(json_encode(array(
+			'user' => (string) $user->ID,
+			'enrollment' => $enrollmentID,
+		)));
+		if (!$encrypted) {
+			return false;
+		}
+
+		$id = Model_JWT::base64url_encode(Model_Crypto::random_bytes(16));
 		$expiration = \WordfenceLS\Controller_Time::time() + Controller_Settings::shared()->get_int(Controller_Settings::OPTION_REMEMBER_DEVICE_DURATION);
-		$jwt = new Model_JWT(array('iv' => $encrypted['iv']), $expiration);
-		$cookieName = 'wfls-remembered-' . Model_JWT::base64url_convert_to($encrypted['data']);
-		$cookieValue = (string) $jwt;
-		setcookie($cookieName, $cookieValue, $expiration, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
+		$jwt = new Model_JWT(array(
+			'type' => self::REMEMBERED_DEVICE_COOKIE_TYPE,
+			'version' => self::REMEMBERED_DEVICE_COOKIE_VERSION,
+			'id' => $id,
+			'data' => $encrypted['data'],
+			'iv' => $encrypted['iv'],
+		), $expiration);
+		return array(
+			'name' => self::REMEMBERED_DEVICE_COOKIE_PREFIX . $id,
+			'value' => (string) $jwt,
+			'expiration' => $expiration,
+		);
+	}
+
+	/**
+	 * Decodes and validates the self-contained portion of a remembered-device cookie.
+	 *
+	 * @param string $name The cookie name.
+	 * @param mixed $value The cookie value.
+	 * @return array|bool The decrypted remembered-device data, or false if invalid.
+	 */
+	private function decode_remembered_device_cookie($name, $value) {
+		if (!is_string($name) || !preg_match('/^wfls\-remembered\-([A-Za-z0-9_-]{22})$/D', $name, $matches) || !is_string($value)) {
+			return false;
+		}
+
+		$jwt = Model_JWT::decode_jwt($value);
+		if (!$jwt || !isset($jwt->payload['type'], $jwt->payload['version'], $jwt->payload['id'], $jwt->payload['data'], $jwt->payload['iv']) ||
+			$jwt->payload['type'] !== self::REMEMBERED_DEVICE_COOKIE_TYPE ||
+			$jwt->payload['version'] !== self::REMEMBERED_DEVICE_COOKIE_VERSION ||
+			!is_string($jwt->payload['id']) || !hash_equals($matches[1], $jwt->payload['id']) ||
+			!is_string($jwt->payload['data']) || !is_string($jwt->payload['iv'])) {
+			return false;
+		}
+
+		$maxExpiration = \WordfenceLS\Controller_Time::time() + Controller_Settings::shared()->get_int(Controller_Settings::OPTION_REMEMBER_DEVICE_DURATION);
+		if (\WordfenceLS\Controller_Time::time() > min($jwt->expiration, $maxExpiration)) { //Either JWT is expired or the remember period was shortened since generating it
+			return false;
+		}
+
+		$decrypted = Model_Symmetric::decrypt(array('data' => $jwt->payload['data'], 'iv' => $jwt->payload['iv']));
+		$rememberedDevice = is_string($decrypted) ? @json_decode($decrypted, true) : false;
+		if (!is_array($rememberedDevice) || !isset($rememberedDevice['user'], $rememberedDevice['enrollment']) ||
+			!is_string($rememberedDevice['user']) || !preg_match('/^[1-9][0-9]*$/D', $rememberedDevice['user']) ||
+			!is_string($rememberedDevice['enrollment']) || !preg_match('/^[1-9][0-9]*$/D', $rememberedDevice['enrollment'])) {
+			return false;
+		}
+
+		return $rememberedDevice;
+	}
+
+	/**
+	 * Returns whether an existing remembered-device cookie should be removed during issuance.
+	 *
+	 * @param string $name The cookie name.
+	 * @param mixed $value The cookie value.
+	 * @param \WP_User $user The user receiving a new cookie.
+	 * @return bool
+	 */
+	private function should_remove_remembered_device_cookie($name, $value, $user) {
+		if (!is_string($name) || strpos($name, self::REMEMBERED_DEVICE_COOKIE_PREFIX) !== 0) {
+			return false;
+		}
+
+		$rememberedDevice = $this->decode_remembered_device_cookie($name, $value);
+		return $rememberedDevice === false || $rememberedDevice['user'] === (string) $user->ID;
 	}
 	
 	/**
@@ -215,9 +292,49 @@ class Controller_Users {
 	 * @return bool
 	 */
 	public function has_2fa_active($user) {
-		global $wpdb;
-		$table = Controller_DB::shared()->secrets;
-		return $this->can_activate_2fa($user) && !!intval($wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$table}` WHERE `user_id` = %d", $user->ID)));
+		if (!$this->can_activate_2fa($user)) {
+			return false;
+		}
+
+		$userID = (int) $user->ID;
+		if (!array_key_exists($userID, $this->twoFactorEnrollmentIDCache)) {
+			global $wpdb;
+			$table = Controller_DB::shared()->secrets;
+			$value = $wpdb->get_var($wpdb->prepare("SELECT `id` FROM `{$table}` WHERE `user_id` = %d LIMIT 1", $userID));
+			$this->twoFactorEnrollmentIDCache[$userID] = ((is_int($value) || is_string($value)) && preg_match('/^[1-9][0-9]*$/D', (string) $value)) ? (string) $value : false;
+		}
+		return $this->twoFactorEnrollmentIDCache[$userID] !== false;
+	}
+
+	/**
+	 * Returns the identifier for the user's current 2FA enrollment.
+	 *
+	 * @param \WP_User $user The user to inspect.
+	 * @return string|bool The enrollment identifier, or false if 2FA is not active.
+	 */
+	private function two_factor_enrollment_id($user) {
+		$userID = (int) $user->ID;
+		if (!array_key_exists($userID, $this->twoFactorEnrollmentIDCache)) {
+			$this->has_2fa_active($user);
+		}
+		return array_key_exists($userID, $this->twoFactorEnrollmentIDCache) ? $this->twoFactorEnrollmentIDCache[$userID] : false;
+	}
+
+	/**
+	 * Clears cached 2FA enrollment and remembered-device state.
+	 *
+	 * @param int|null $userID The user to clear, or null to clear all users.
+	 * @return void
+	 */
+	public function clear_2fa_active_cache($userID = null) {
+		if ($userID === null) {
+			$this->twoFactorEnrollmentIDCache = array();
+			$this->remembered2FACache = array();
+		}
+		else {
+			$userID = (int) $userID;
+			unset($this->twoFactorEnrollmentIDCache[$userID], $this->remembered2FACache[$userID]);
+		}
 	}
 	
 	/**
@@ -228,7 +345,9 @@ class Controller_Users {
 	public function deactivate_2fa($user) {
 		global $wpdb;
 		$table = Controller_DB::shared()->secrets;
-		$wpdb->query($wpdb->prepare("DELETE FROM `{$table}` WHERE `user_id` = %d", $user->ID));
+		if ($wpdb->query($wpdb->prepare("DELETE FROM `{$table}` WHERE `user_id` = %d", $user->ID)) !== false) {
+			$this->clear_2fa_active_cache($user->ID);
+		}
 		
 		/**
 		 * Fires when 2FA is disabled for a user.
@@ -283,17 +402,17 @@ class Controller_Users {
 	 * Returns the number of recovery codes remaining for the user or null if the user does not have 2FA active.
 	 *
 	 * @param \WP_User $user
-	 * @return float|null
+	 * @return int
 	 */
 	public function recovery_code_count($user) {
 		global $wpdb;
 		$table = Controller_DB::shared()->secrets;
 		$record = $wpdb->get_var($wpdb->prepare("SELECT `recovery` FROM `{$table}` WHERE `user_id` = %d", $user->ID));
 		if (!$record) {
-			return null;
+			return 0;
 		}
 		
-		return floor(Model_Crypto::strlen($record) / self::RECOVERY_CODE_SIZE);
+		return intdiv(Model_Crypto::strlen($record), self::RECOVERY_CODE_SIZE);
 	}
 	
 	/**

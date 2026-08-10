@@ -19,6 +19,7 @@ class Controller_WordfenceLS {
 	private $management_assets_registered = false;
 	private $management_assets_enqueued = false;
 	private $use_core_font_awesome_styles = null;
+	private $authentication_context_stack = array();
 	
 	/**
 	 * Returns the singleton Controller_Wordfence2FA.
@@ -232,7 +233,7 @@ END
 		?>
 		<div id="<?php echo esc_attr(Controller_Notices::PERSISTENT_NOTICE_STANDALONE_DISCONTINUING) ?>" class="notice notice-warning <?php if (!(isset($_GET['page']) && $_GET['page'] == 'WFLS')): ?>is-dismissible<?php endif; ?> wfls-persistent-notice">
 			<p><strong><?php esc_html_e('Your site is currently using the "Wordfence Login Security” plugin.', 'wordfence-login-security') ?></strong></p>
-			<p><?php esc_html_e('This plugin will be discontinued on or around July 1, 2026, because its features are already included in the main Wordfence plugin.', 'wordfence-login-security') ?></p>
+			<p><?php esc_html_e('This plugin will be discontinued on or around August 12, 2026, because its features are already included in the main Wordfence plugin.', 'wordfence-login-security') ?></p>
 			<p><?php esc_html_e('To continue receiving updates and security improvements, please install and activate the main Wordfence plugin — also available for free.', 'wordfence-login-security') ?></p>
 			<p><a class="wfls-btn wfls-btn-primary wfls-btn-sm" href="<?php echo esc_url(Utility_URL::maybe_network_admin_url('plugin-install.php?s=wordfence&tab=search&type=term')) ?>"><?php esc_html_e('Install Wordfence', 'wordfence-login-security') ?></a></p>
 		</div>
@@ -420,9 +421,10 @@ END
 
 	private function get_2fa_management_assets($embedded = false) {
 		$assets = array(
+			Model_Script::create('jquery-ui-dialog')->setRegistered(),
 			Model_Script::create('wordfence-ls-jquery.qrcode', Model_Asset::js('jquery.qrcode.min.js'), array('jquery'), WORDFENCE_LS_VERSION),
 		);
-		$assets[] = Model_Script::create('wordfence-ls-admin', Model_Asset::js('admin.js'), array('jquery'), WORDFENCE_LS_VERSION)
+		$assets[] = Model_Script::create('wordfence-ls-admin', Model_Asset::js('admin.js'), array('jquery', 'jquery-ui-dialog'), WORDFENCE_LS_VERSION)
 			->withTranslation('You have unsaved changes to your options. If you leave this page, those changes will be lost.', __('You have unsaved changes to your options. If you leave this page, those changes will be lost.', 'wordfence-login-security'))
 			->setTranslationObjectName('WFLS_ADMIN_TRANSLATIONS');
 		$registered = array(
@@ -434,10 +436,11 @@ END
 			$this->management_assets_registered = true;
 		}
 		$assets = array_merge($assets, $registered);
-		$assets[] = Model_Style::create('wordfence-ls-admin', Model_Asset::css('admin.css'), array(), WORDFENCE_LS_VERSION);
+		$assets[] = Model_Style::create('wp-jquery-ui-dialog')->setRegistered();
+		$assets[] = Model_Style::create('dashicons')->setRegistered();
+		$assets[] = Model_Style::create('wordfence-ls-admin', Model_Asset::css('admin.css'), array('wp-jquery-ui-dialog', 'dashicons'), WORDFENCE_LS_VERSION);
 		$assets[] = Model_Style::create('wordfence-ls-ionicons', Model_Asset::css('ionicons.css'), array(), WORDFENCE_LS_VERSION);
 		if ($embedded) {
-			$assets[] = Model_Style::create('dashicons');
 			$assets[] = Model_Style::create('wordfence-ls-embedded', Model_Asset::css('embedded.css'), array(), WORDFENCE_LS_VERSION);
 		}
 		else {
@@ -457,8 +460,6 @@ END
 
 	private function enqueue_2fa_management_assets($embedded = false) {
 		if ($this->management_assets_enqueued) { return; }
-		wp_enqueue_script('jquery-ui-dialog');
-		wp_enqueue_style('wp-jquery-ui-dialog');
 		foreach ($this->get_2fa_management_assets($embedded) as $asset) {
 			$asset->enqueue();
 		}
@@ -632,6 +633,47 @@ END
 		return ( isset( $_POST['login'], $_POST['username'], $_POST['password'] ) && is_string($nonceValue) && wp_verify_nonce( $nonceValue, 'woocommerce-login' ) );
 	}
 	
+	/**
+	 * Runs WordPress authentication within a scoped WFLS authentication context.
+	 *
+	 * @param string $username Username to authenticate.
+	 * @param string $password Password to authenticate.
+	 * @param bool $isCombinedCheck Whether the call is checking the base password from combined credentials.
+	 * @return array The authentication result and whether combined 2FA validated in this context.
+	 */
+	private function _authenticate_with_context($username, $password, $isCombinedCheck) {
+		$this->authentication_context_stack[] = array(
+			'username' => sanitize_user($username),
+			'password' => trim($password),
+			'claimed' => false,
+			'is_combined_check' => (bool) $isCombinedCheck,
+			'combined_2fa_valid' => false,
+		);
+		$contextIndex = count($this->authentication_context_stack) - 1;
+
+		try {
+			$user = wp_authenticate($username, $password);
+			return array(
+				'user' => $user,
+				'combined_2fa_valid' => $this->authentication_context_stack[$contextIndex]['combined_2fa_valid'],
+			);
+		}
+		finally {
+			array_pop($this->authentication_context_stack);
+		}
+	}
+
+	/**
+	 * Checks credentials for the AJAX login preflight without weakening later authentication calls.
+	 *
+	 * @param string $username Username to authenticate.
+	 * @param string $password Password to authenticate.
+	 * @return array The authentication result and whether combined 2FA validated during the preflight.
+	 */
+	public function authenticate_preflight($username, $password) {
+		return $this->_authenticate_with_context($username, $password, false);
+	}
+
 	public function _authenticate($user, $username, $password) {
 		if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST && !Controller_Settings::shared()->get_bool(Controller_Settings::OPTION_XMLRPC_ENABLED)) { //XML-RPC call and we're not enforcing 2FA on it
 			return $user;
@@ -641,8 +683,17 @@ END
 			return $user;
 		}
 
-		$isLogin = !(defined('WORDFENCE_LS_AUTHENTICATION_CHECK') && WORDFENCE_LS_AUTHENTICATION_CHECK); //Checking for the purpose of prompting for 2FA, don't enforce it here
-		$isCombinedCheck = (defined('WORDFENCE_LS_CHECKING_COMBINED') && WORDFENCE_LS_CHECKING_COMBINED);
+		$contextIndex = count($this->authentication_context_stack) - 1;
+		$authenticationContext = null;
+		if ($contextIndex >= 0) {
+			$candidateContext = $this->authentication_context_stack[$contextIndex];
+			if (!$candidateContext['claimed'] && $candidateContext['username'] === $username && $candidateContext['password'] === $password) {
+				$this->authentication_context_stack[$contextIndex]['claimed'] = true;
+				$authenticationContext = $candidateContext;
+			}
+		}
+		$isLogin = $authenticationContext === null;
+		$isCombinedCheck = $authenticationContext !== null && $authenticationContext['is_combined_check'];
 		$combinedTwoFactor = false;
 
 		/*
@@ -650,7 +701,7 @@ END
 		 * to see if the user has provided a combined password in the format `<password><code>`, populating $user from
 		 * that if so.
 		 */
-		if (!defined('WORDFENCE_LS_CHECKING_COMBINED') && (!isset($_POST['wfls-token']) || !is_string($_POST['wfls-token'])) && (!is_object($user) || !($user instanceof \WP_User))) {
+		if (!$isCombinedCheck && (!isset($_POST['wfls-token']) || !is_string($_POST['wfls-token'])) && (!is_object($user) || !($user instanceof \WP_User))) {
 			//Compatibility with WF legacy 2FA
 			$combinedTOTPRegex = '/((?:[0-9]{3}\s*){2})$/i';
 			$combinedRecoveryRegex = '/((?:[a-f0-9]{4}\s*){4})$/i';
@@ -673,11 +724,12 @@ END
 			}
 
 			if (isset($revisedPassword)) {
-				define('WORDFENCE_LS_CHECKING_COMBINED', true); //Avoid recursing into this block
-				if (!defined('WORDFENCE_LS_AUTHENTICATION_CHECK')) { define('WORDFENCE_LS_AUTHENTICATION_CHECK', true); }
-				$revisedUser = wp_authenticate($username, $revisedPassword);
+				$combinedCheck = $this->_authenticate_with_context($username, $revisedPassword, true);
+				$revisedUser = $combinedCheck['user'];
 				if (is_object($revisedUser) && ($revisedUser instanceof \WP_User) && Controller_TOTP::shared()->validate_2fa($revisedUser, $code, $isLogin)) {
-					define('WORDFENCE_LS_COMBINED_IS_VALID', true); //This will cause the front-end to skip the 2FA prompt
+					if ($authenticationContext !== null) {
+						$this->authentication_context_stack[$contextIndex]['combined_2fa_valid'] = true;
+					}
 					$user = $revisedUser;
 					$combinedTwoFactor = true;
 				}
